@@ -1,16 +1,16 @@
 import sys
 import logging
-from live_sub_llm import AudioWorker
 
-from PyQt5.QtWidgets import QApplication
-from UI.subtitle_ui import SubtitleWindow
 from log.logger_config import setup_logging
+setup_logging()
+
+from live_sub_llm import AudioWorker
+from UI.subtitle_ui import SubtitleWindow
+from PyQt5.QtWidgets import QApplication
 
 
 def main():
     # 1. 初始化日志系统
-    log_path = setup_logging()
-
     # 2. 配置全局异常捕获 (Crash Handler)
     # 这一步非常重要，防止程序默默闪退而不报错
     def handle_exception(exc_type, exc_value, exc_traceback):
