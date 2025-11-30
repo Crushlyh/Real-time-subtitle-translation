@@ -1,6 +1,7 @@
 import sys
 import time
 import os
+import logging
 import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy import signal
@@ -9,6 +10,7 @@ from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint
 from openai import OpenAI
 
+from log.logger_config import setup_logging
 # ================= 配置区域 (请根据您的环境修改) =================
 
 # 1. 本地大模型设置 (连接 Ollama 或 LM Studio)
@@ -25,121 +27,144 @@ LLM_MODEL_NAME = "local-model"
 # 2. Whisper 设置
 WHISPER_SIZE = "medium"  # 既然有LLM做后处理，Whisper可以用medium提速
 DEVICE = "cuda"
+BUFFER_DURATION = 1.5
 
 
 # =============================================================
+# 初始化日志
+setup_logging()
+
 
 class AudioWorker(QThread):
     text_updated = pyqtSignal(str)
+    status_updated = pyqtSignal(str)
 
     def run(self):
-        # --- 初始化 Whisper ---
-        print(f"正在加载 Whisper ({WHISPER_SIZE})...")
-        whisper = WhisperModel(WHISPER_SIZE, device=DEVICE, compute_type="float16")
+        logging.info(f"正在加载 Whisper 模型: {WHISPER_SIZE}")
+        self.status_updated.emit(f"正在加载 Whisper ({WHISPER_SIZE})...")
 
-        # --- 初始化 LLM 客户端 ---
-        print(f"正在连接本地大模型: {LLM_BASE_URL}...")
         try:
-            client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
-            # 测试连接
-            client.models.list()
-            print("✅ 本地大模型连接成功！")
+            whisper = WhisperModel(WHISPER_SIZE, device=DEVICE, compute_type="float16")
+            logging.info("Whisper 模型加载成功")
         except Exception as e:
-            print(f"❌ 无法连接本地大模型: {e}")
-            print("请检查 LM Studio/Ollama 是否已启动并开启 Server 模式")
+            logging.error(f"Whisper 加载失败: {e}", exc_info=True)
+            self.status_updated.emit("Whisper 加载失败")
             return
 
-        # --- 初始化音频录制 (WASAPI Loopback) ---
+        client = None
+        try:
+            logging.info(f"正在连接 LLM: {LLM_BASE_URL}")
+            client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+            client.models.list()
+            logging.info("LLM 连接成功")
+        except Exception as e:
+            logging.warning(f"本地 LLM 连接失败: {e}")
+            self.status_updated.emit("⚠️ 本地 LLM 未连接")
+
         p = pyaudio.PyAudio()
-        wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-        default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-
-        if not default_speakers["isLoopbackDevice"]:
-            for loopback in p.get_loopback_device_info_generator():
-                if default_speakers["name"] in loopback["name"]:
-                    default_speakers = loopback
-                    break
-
-        print(f"🎤 监听设备: {default_speakers['name']}")
-
-        sys_rate = int(default_speakers["defaultSampleRate"])
-        channels = default_speakers["maxInputChannels"]
-        target_rate = 16000
-
-        stream = p.open(format=pyaudio.paInt16, channels=channels, rate=sys_rate,
-                        input=True, input_device_index=default_speakers["index"],
-                        frames_per_buffer=1024)
-
-        frames = []
-        chunk_duration = 1.5  # 3秒一切片
-        frames_needed = int(sys_rate * chunk_duration / 1024)
-
-        print("🚀 服务已启动，播放视频即可看到字幕...")
 
         while True:
-            data = stream.read(1024, exception_on_overflow=False)
-            frames.append(data)
+            try:
+                # 寻找设备逻辑
+                wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+                default_device_index = wasapi_info["defaultOutputDevice"]
+                device_info = p.get_device_info_by_index(default_device_index)
 
-            if len(frames) >= frames_needed:
-                # 音频预处理 (Bytes -> Float32 -> Resample)
-                audio_bytes = b''.join(frames)
-                audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
-                audio_float = audio_np.astype(np.float32) / 32768.0
+                if not device_info["isLoopbackDevice"]:
+                    for loopback in p.get_loopback_device_info_generator():
+                        if device_info["name"] in loopback["name"]:
+                            device_info = loopback
+                            break
 
-                if channels > 1:
-                    audio_float = audio_float.reshape(-1, channels).mean(axis=1)
+                current_device_name = device_info['name']
+                # 使用 logging 记录
+                logging.info(f"绑定音频设备: {current_device_name} (Index: {device_info['index']})")
+                self.status_updated.emit(f"正在监听: {current_device_name}")
 
-                if sys_rate != target_rate:
-                    num_samples = int(len(audio_float) * target_rate / sys_rate)
-                    audio_float = signal.resample(audio_float, num_samples)
-                    audio_float = np.clip(audio_float, -1.0, 1.0)
+                sys_rate = int(device_info["defaultSampleRate"])
+                channels = device_info["maxInputChannels"]
+                target_rate = 16000
 
-                frames = []  # 清空缓冲
+                stream = p.open(format=pyaudio.paInt16,
+                                channels=channels,
+                                rate=sys_rate,
+                                input=True,
+                                input_device_index=device_info["index"],
+                                frames_per_buffer=1024)
 
-                if np.max(np.abs(audio_float)) < 0.01: continue
+                frames = []
+                frames_needed = int(sys_rate * BUFFER_DURATION / 1024)
 
-                # 1. Whisper 听写 (只负责听，不做翻译，task="transcribe")
-                # 我们让 Whisper 尽可能忠实地记录原文
-                segments, _ = whisper.transcribe(
-                    audio_float,
-                    beam_size=5,
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500),
-                    condition_on_previous_text=False
-                )
+                logging.info("开始采集音频流...")
 
-                raw_text = " ".join([s.text for s in segments]).strip()
+                while True:
+                    try:
+                        data = stream.read(1024, exception_on_overflow=False)
+                        frames.append(data)
+                    except (OSError, IOError) as e:
+                        logging.warning(f"音频流异常: {e}")
+                        break
 
-                # 过滤极短文本或幻觉
-                if len(raw_text) < 2 or "订阅" in raw_text or "打赏" in raw_text:
-                    continue
+                    if len(frames) >= frames_needed:
+                        audio_bytes = b''.join(frames)
+                        frames = []
 
-                print(f"👂 听到: {raw_text}")
+                        audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
+                        audio_float = audio_np.astype(np.float32) / 32768.0
 
-                # 2. 调用本地大模型进行翻译/润色
-                # 这里使用异步思维，但为了代码简单我们先同步调用
-                # 4070S 跑 Qwen-14B 翻译一句话只需要几百毫秒
-                try:
-                    completion = client.chat.completions.create(
-                        model=LLM_MODEL_NAME,
-                        messages=[
-                            {"role": "system",
-                             "content": "你是一个专业的字幕翻译工具。将用户的输入直接翻译成中文。简练、准确。如果输入是乱码或无意义声音，请输出'...'。不要解释，只输出译文。"},
-                            {"role": "user", "content": raw_text}
-                        ],
-                        temperature=0.3,  # 低温度保证稳定
-                        max_tokens=100  # 字幕不需要太长
-                    )
-                    translated_text = completion.choices[0].message.content.strip()
+                        if channels > 1:
+                            audio_float = audio_float.reshape(-1, channels).mean(axis=1)
 
-                    if translated_text and translated_text != "...":
-                        print(f"🤖 翻译: {translated_text}")
-                        self.text_updated.emit(translated_text)
+                        if sys_rate != target_rate:
+                            num_samples = int(len(audio_float) * target_rate / sys_rate)
+                            audio_float = signal.resample(audio_float, num_samples)
+                            audio_float = np.clip(audio_float, -1.0, 1.0)
 
-                except Exception as e:
-                    print(f"LLM 调用失败: {e}")
-                    # 如果 LLM 挂了，降级显示原文
-                    self.text_updated.emit(raw_text)
+                        if np.max(np.abs(audio_float)) < 0.01:
+                            continue
+
+                        segments, _ = whisper.transcribe(
+                            audio_float,
+                            beam_size=5,
+                            vad_filter=True,
+                            vad_parameters=dict(min_silence_duration_ms=400),
+                            condition_on_previous_text=False
+                        )
+
+                        raw_text = " ".join([s.text for s in segments]).strip()
+
+                        if len(raw_text) < 2: continue
+
+                        logging.info(f"[原文] {raw_text}")
+
+                        final_text = raw_text
+                        if client:
+                            try:
+                                completion = client.chat.completions.create(
+                                    model=LLM_MODEL_NAME,
+                                    messages=[
+                                        {"role": "system", "content": "翻译成中文。简练。"},
+                                        {"role": "user", "content": raw_text}
+                                    ],
+                                    temperature=0.1,
+                                    max_tokens=60
+                                )
+                                trans_text = completion.choices[0].message.content.strip()
+                                logging.info(f"[译文] {trans_text}")
+                                final_text = trans_text
+                            except Exception as e:
+                                logging.error(f"LLM 请求失败: {e}")
+
+                        self.text_updated.emit(final_text)
+
+                stream.stop_stream()
+                stream.close()
+                logging.info("重连设备中...")
+                time.sleep(1)
+
+            except Exception as e:
+                logging.critical(f"主循环崩溃: {e}", exc_info=True)
+                time.sleep(2)
 
 
 # --- UI 部分 (保持不变，美化一下) ---
