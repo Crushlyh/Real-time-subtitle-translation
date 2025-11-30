@@ -1,17 +1,14 @@
-import sys
 import time
 import os
-import logging
 import numpy as np
+import logging
 import pyaudiowpatch as pyaudio
 from scipy import signal
 from faster_whisper import WhisperModel
-from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint
+from PyQt5.QtCore import QThread, pyqtSignal
 from openai import OpenAI
 
-from log.logger_config import setup_logging
-# ================= 配置区域 (请根据您的环境修改) =================
+# ================= 配置区域 =================
 
 # 1. 本地大模型设置 (连接 Ollama 或 LM Studio)
 # 如果是 LM Studio，通常是 "http://localhost:1234/v1"
@@ -31,10 +28,7 @@ BUFFER_DURATION = 2.0  # 稍微延长切片时间到 2秒
 OVERLAP_DURATION = 0.5 # ★新增：每次多听前 0.5秒 的声音，防止切词
 
 
-# =============================================================
-# 初始化日志
-setup_logging()
-
+# ===========================================
 
 class AudioWorker(QThread):
     text_updated = pyqtSignal(str)
@@ -49,26 +43,28 @@ class AudioWorker(QThread):
             logging.info("Whisper 模型加载成功")
         except Exception as e:
             logging.error(f"Whisper 加载失败: {e}", exc_info=True)
-            self.status_updated.emit("Whisper 加载失败")
+            self.status_updated.emit("模型加载失败，请检查日志")
             return
 
+        # 连接 LLM
         client = None
         try:
-            logging.info(f"正在连接 LLM: {LLM_BASE_URL}")
             client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+            # 简单测试连接
             client.models.list()
-            logging.info("LLM 连接成功")
+            logging.info("本地 LLM 连接成功")
         except Exception as e:
-            logging.warning(f"本地 LLM 连接失败: {e}")
+            logging.warning(f"LLM 连接失败: {e}")
             self.status_updated.emit("⚠️ 本地 LLM 未连接")
 
         p = pyaudio.PyAudio()
-        # 存储上一段音频的末尾
+
+        # 缓存上一段音频的尾巴，用于拼接
         prev_audio_chunk = np.array([], dtype=np.float32)
 
         while True:
             try:
-                # 寻找设备逻辑
+                # --- 自动寻找 Loopback 设备 ---
                 wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
                 default_device_index = wasapi_info["defaultOutputDevice"]
                 device_info = p.get_device_info_by_index(default_device_index)
@@ -80,9 +76,8 @@ class AudioWorker(QThread):
                             break
 
                 current_device_name = device_info['name']
-                # 使用 logging 记录
-                logging.info(f"绑定音频设备: {current_device_name} (Index: {device_info['index']})")
-                self.status_updated.emit(f"正在监听: {current_device_name}")
+                logging.info(f"绑定设备: {current_device_name}")
+                self.status_updated.emit(f"监听: {current_device_name}")
 
                 sys_rate = int(device_info["defaultSampleRate"])
                 channels = device_info["maxInputChannels"]
@@ -98,64 +93,66 @@ class AudioWorker(QThread):
                 frames = []
                 frames_needed = int(sys_rate * BUFFER_DURATION / 1024)
 
-                logging.info(f"监听中... (缓冲区: {BUFFER_DURATION}s, 重叠: {OVERLAP_DURATION}s)")
+                logging.info("音频流启动...")
 
                 while True:
                     try:
                         data = stream.read(1024, exception_on_overflow=False)
                         frames.append(data)
-                    except (OSError, IOError) as e:
-                        logging.warning(f"音频流异常: {e}")
-                        break
+                    except Exception:
+                        break  # 设备可能断开，触发外层循环重连
 
                     if len(frames) >= frames_needed:
                         audio_bytes = b''.join(frames)
                         frames = []
-                        # 1. 转 Float32
+
+                        # 1. 预处理
                         audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
                         audio_float = audio_np.astype(np.float32) / 32768.0
-                        # 2. 转单声道
+
                         if channels > 1:
                             audio_float = audio_float.reshape(-1, channels).mean(axis=1)
-                        # 3. 重采样
+
                         if sys_rate != target_rate:
                             num_samples = int(len(audio_float) * target_rate / sys_rate)
                             audio_float = signal.resample(audio_float, num_samples)
                             audio_float = np.clip(audio_float, -1.0, 1.0)
 
+                        # 2. 自动增益 (Auto Gain)
                         max_vol = np.max(np.abs(audio_float))
                         if max_vol < 0.01:
-                            continue  # 纯静音跳过
+                            continue
                         elif max_vol < 0.5:
-                            # 如果最大音量不到 50%，尝试放大到 80%
                             gain = 0.8 / (max_vol + 1e-6)
                             audio_float = audio_float * gain
-                            audio_float = np.clip(audio_float, -1.0, 1.0)  # 防止爆音
+                            audio_float = np.clip(audio_float, -1.0, 1.0)
 
-                        # 这能修复被切断的词
+                        # 3. 重叠拼接 (Overlap)
                         if len(prev_audio_chunk) > 0:
                             combined_audio = np.concatenate((prev_audio_chunk, audio_float))
                         else:
                             combined_audio = audio_float
 
-                        # 保存当前音频的最后 0.5秒，留给下一轮用
                         overlap_samples = int(target_rate * OVERLAP_DURATION)
                         prev_audio_chunk = audio_float[-overlap_samples:]
 
+                        # 4. Whisper 识别
                         segments, _ = whisper.transcribe(
                             combined_audio,
                             beam_size=5,
                             vad_filter=True,
-                            vad_parameters=dict(min_silence_duration_ms=400),
+                            vad_parameters=dict(min_silence_duration_ms=300),
                             condition_on_previous_text=False,
-                            initial_prompt="请忽略不完整的句子"
+                            initial_prompt="以下是字幕，请忽略不完整句子。"
                         )
 
                         raw_text = " ".join([s.text for s in segments]).strip()
 
                         if len(raw_text) < 2: continue
+
                         logging.info(f"[原文] {raw_text}")
 
+                        # 5. LLM 翻译
                         final_text = raw_text
                         if client:
                             try:
@@ -171,78 +168,15 @@ class AudioWorker(QThread):
                                 logging.info(f"[译文] {trans_text}")
                                 final_text = trans_text
                             except Exception as e:
-                                logging.error(f"LLM 请求失败: {e}")
+                                logging.error(f"LLM 错误: {e}")
 
+                        # 发送信号给 UI
                         self.text_updated.emit(final_text)
 
                 stream.stop_stream()
                 stream.close()
-                logging.info("重连设备中...")
                 time.sleep(1)
 
             except Exception as e:
-                logging.critical(f"主循环崩溃: {e}", exc_info=True)
+                logging.error(f"Logic Error: {e}", exc_info=True)
                 time.sleep(2)
-
-
-# --- UI 部分 (保持不变，美化一下) ---
-class SubtitleWindow(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle('AI 实时字幕')
-
-        layout = QVBoxLayout()
-        self.label = QLabel("AI 听译准备中...", self)
-
-        # 样式微调：加个金色边框更有科技感
-        self.label.setStyleSheet("""
-            QLabel {
-                color: #FFFFFF;
-                font-family: "Microsoft YaHei UI", SimHei;
-                font-size: 24px;
-                font-weight: 600;
-                background-color: rgba(0, 0, 0, 180);
-                border: 1px solid rgba(255, 255, 255, 50);
-                border-radius: 10px;
-                padding: 15px;
-            }
-        """)
-        self.label.setAlignment(Qt.AlignCenter)
-        self.label.setWordWrap(True)
-
-        layout.addWidget(self.label)
-        self.setLayout(layout)
-
-        screen = QApplication.primaryScreen().geometry()
-        self.resize(900, 130)
-        self.move((screen.width() - 900) // 2, screen.height() - 250)
-
-    def update_text(self, text):
-        self.label.setText(text)
-
-    # 拖动逻辑
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.oldPos = event.globalPos()
-
-    def mouseMoveEvent(self, event):
-        if event.buttons() == Qt.LeftButton:
-            delta = QPoint(event.globalPos() - self.oldPos)
-            self.move(self.x() + delta.x(), self.y() + delta.y())
-            self.oldPos = event.globalPos()
-
-
-def main():
-    app = QApplication(sys.argv)
-    window = SubtitleWindow()
-    window.show()
-    worker = AudioWorker()
-    worker.text_updated.connect(window.update_text)
-    worker.start()
-    sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()
