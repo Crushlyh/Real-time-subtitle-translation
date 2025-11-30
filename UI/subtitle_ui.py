@@ -1,69 +1,57 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QPushButton
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QProgressBar
+# ★★★ 1. 必须导入 pyqtSignal ★★★
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 
 
 class SubtitleWindow(QWidget):
+    # ★★★ 2. 必须在这里定义信号 (不能在 __init__ 里) ★★★
+    pause_signal = pyqtSignal()
+
     def __init__(self):
         super().__init__()
 
-        # --- 状态变量 ---
         self.font_size_origin = 18
         self.font_size_trans = 30
         self.last_origin = "Waiting for audio..."
         self.last_trans = "等待音频输入..."
-        self.current_opacity = 1.0  # 记录当前透明度
+        self.current_opacity = 1.0
 
         self.initUI()
         self.oldPos = self.pos()
 
     def initUI(self):
-        # --- 窗口属性 ---
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle('AI 实时字幕')
 
-        # --- 主容器布局 ---
-        # 我们使用一个主 QVBoxLayout，里面放两层：
-        # 1. 顶部控制栏 (QHBoxLayout)
-        # 2. 下方字幕区域 (QLabel)
         self.main_layout = QVBoxLayout()
-        self.main_layout.setContentsMargins(0, 0, 0, 0)  # 消除最外层边距
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
-        # --- 【背景容器】 ---
-        # 为了让标题栏和字幕看起来是一体的，我们在主布局里放一个 Widget 作为背景
         self.container = QWidget()
         self.container.setStyleSheet("""
             QWidget {
-                background-color: rgba(70, 65, 60, 195); /* 深莫兰迪暖灰背景 */
-                border: 1px solid rgba(200, 190, 180, 50); /* 柔和边框 */
+                background-color: rgba(70, 65, 60, 195);
+                border: 1px solid rgba(200, 190, 180, 50);
                 border-radius: 15px;
             }
         """)
 
-        # 容器内部布局
         self.container_layout = QVBoxLayout(self.container)
-        self.container_layout.setContentsMargins(15, 10, 15, 15)  # 内部留白
+        self.container_layout.setContentsMargins(15, 10, 15, 15)
 
-        # ====================
-        # Part 1: 顶部控制栏
-        # ====================
+        # --- 顶部控制栏 ---
         self.top_bar = QHBoxLayout()
-
-        # 1.1 左侧状态文字
         self.status_label = QLabel("Ready", self)
         self.status_label.setStyleSheet("color: #AAAAAA; font-size: 11px; border: none; background: transparent;")
         self.status_label.setFixedHeight(20)
 
-        # 1.2 右侧按钮组
-        # 辅助函数：快速创建样式统一的小按钮
         def create_btn(text, tooltip, callback):
             btn = QPushButton(text)
             btn.setFixedSize(24, 24)
             btn.setToolTip(tooltip)
             btn.setCursor(Qt.PointingHandCursor)
-            # 按钮样式：平时透明，鼠标悬停变色
             btn.setStyleSheet("""
                 QPushButton {
                     background-color: transparent;
@@ -84,51 +72,59 @@ class SubtitleWindow(QWidget):
             btn.clicked.connect(callback)
             return btn
 
-        # 创建按钮
+        # ★★★ 3. 添加暂停按钮 ★★★
+        self.btn_pause = create_btn("⏸", "暂停/继续", self.on_pause_clicked)
         btn_font_up = create_btn("A+", "放大字体", self.increase_font)
         btn_font_down = create_btn("A-", "缩小字体", self.decrease_font)
         btn_opacity = create_btn("👁", "调节透明度", self.toggle_opacity)
         btn_close = create_btn("✕", "退出程序", self.close_app)
-        # 给关闭按钮单独加一个红色悬停效果
         btn_close.setStyleSheet(
             btn_close.styleSheet().replace("QPushButton:hover {", "QPushButton:hover { color: #FF6666; "))
 
-        # 组装顶部栏
         self.top_bar.addWidget(self.status_label)
-        self.top_bar.addStretch()  # 弹簧，把按钮顶到右边
+        self.top_bar.addStretch()
+        self.top_bar.addWidget(self.btn_pause)  # 加入布局
         self.top_bar.addWidget(btn_font_up)
         self.top_bar.addWidget(btn_font_down)
         self.top_bar.addWidget(btn_opacity)
         self.top_bar.addWidget(btn_close)
 
-        # ====================
-        # Part 2: 字幕显示区
-        # ====================
+        # --- 字幕区 ---
         self.label = QLabel(self)
-        self.label.setStyleSheet("border: none; background: transparent;")  # 移除Label自带背景，使用Container的
+        self.label.setStyleSheet("border: none; background: transparent;")
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setWordWrap(True)
-
-        # 初始刷新
         self.refresh_display()
 
-        # ====================
-        # 组装整体
-        # ====================
+        # --- 音量条 ---
+        self.volume_bar = QProgressBar(self.container)
+        self.volume_bar.setFixedHeight(3)
+        self.volume_bar.setTextVisible(False)
+        self.volume_bar.setRange(0, 100)
+        self.volume_bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                background-color: rgba(0,0,0,50);
+                border-radius: 1px;
+            }
+            QProgressBar::chunk {
+                background-color: #B5CABD;
+            }
+        """)
+
         self.container_layout.addLayout(self.top_bar)
         self.container_layout.addWidget(self.label)
+        self.container_layout.addWidget(self.volume_bar)  # 加入音量条
 
         self.main_layout.addWidget(self.container)
         self.setLayout(self.main_layout)
 
-        # --- 窗口大小与位置 ---
         screen = QApplication.primaryScreen().geometry()
         width, height = 900, 180
         self.resize(width, height)
         self.move((screen.width() - width) // 2, screen.height() - 300)
 
-    # --- 功能逻辑 ---
-
+    # --- 逻辑功能 ---
     def update_text(self, original_text, translated_text):
         self.last_origin = original_text
         self.last_trans = translated_text
@@ -137,7 +133,6 @@ class SubtitleWindow(QWidget):
     def refresh_display(self):
         color_origin = "#B5CABD"
         color_trans = "#E8D3C5"
-
         html_content = f"""
         <div style='line-height: 1.4;'>
             <span style='font-size: {self.font_size_origin}px; color: {color_origin}; font-family: "Segoe UI", Arial; font-weight: 500;'>
@@ -152,11 +147,26 @@ class SubtitleWindow(QWidget):
         self.label.setText(html_content)
 
     def update_status(self, text):
-        # 状态文字太长的话截断一下，防止挤压按钮
         if len(text) > 30: text = text[:28] + "..."
         self.status_label.setText(text)
 
-    # --- 按钮回调函数 ---
+    # ★★★ 4. 暂停按钮回调 ★★★
+    def on_pause_clicked(self):
+        if self.btn_pause.text() == "⏸":
+            self.btn_pause.setText("▶")
+            self.update_status("已暂停 (省电模式)")
+        else:
+            self.btn_pause.setText("⏸")
+            self.update_status("正在监听...")
+
+        # 发送信号
+        self.pause_signal.emit()
+
+    # ★★★ 5. 音量更新回调 ★★★
+    def update_volume(self, vol_float):
+        display_vol = int(vol_float * 300)
+        if display_vol > 100: display_vol = 100
+        self.volume_bar.setValue(display_vol)
 
     def increase_font(self):
         self.font_size_trans += 2
@@ -170,24 +180,30 @@ class SubtitleWindow(QWidget):
             self.refresh_display()
 
     def toggle_opacity(self):
-        # 循环切换透明度: 1.0 -> 0.8 -> 0.5 -> 1.0
         if self.current_opacity > 0.9:
             self.current_opacity = 0.8
         elif self.current_opacity > 0.6:
             self.current_opacity = 0.5
         else:
             self.current_opacity = 1.0
-
         self.setWindowOpacity(self.current_opacity)
         self.status_label.setText(f"Opacity: {int(self.current_opacity * 100)}%")
 
     def close_app(self):
-        QApplication.instance().quit()
+        # 以前是 QApplication.instance().quit()
+        # 现在改成：
+        self.hide() # 隐藏窗口
+        # 同时发送暂停信号，让后台停止录音省电
+        self.pause_signal.emit()
 
-    # --- 鼠标拖动逻辑 (只允许拖动背景，不影响按钮点击) ---
+    # 2. 新增：重写窗口关闭事件 (防止用户点任务栏关闭导致程序彻底退出)
+    def closeEvent(self, event):
+        event.ignore()  # 忽略系统的关闭请求
+        self.hide()  # 改为隐藏
+        self.pause_signal.emit()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            # 只有当鼠标点在"背景"上时才记录位置，点在按钮上会被按钮事件拦截
             self.oldPos = event.globalPos()
 
     def mouseMoveEvent(self, event):

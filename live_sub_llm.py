@@ -51,10 +51,13 @@ LLM_MODEL_NAME = config.get("LLM", "model_name")
 class AudioWorker(QThread):
     text_updated = pyqtSignal(str, str)
     status_updated = pyqtSignal(str)
+    # ★ 新增：发送音量大小 (0.0 ~ 1.0)
+    volume_updated = pyqtSignal(float)
 
     def __init__(self):
         super().__init__()
         self.running = True
+        self.paused = False  # ★ 新增：暂停状态
         self.audio_queue = queue.Queue(maxsize=10)
         self.history_context = []
 
@@ -170,6 +173,9 @@ class AudioWorker(QThread):
         p = pyaudio.PyAudio()
 
         while self.running:
+            if self.paused:
+                time.sleep(0.1)
+                continue
             try:
                 # 寻找 Loopback 设备
                 wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
@@ -196,8 +202,22 @@ class AudioWorker(QThread):
                 logging.info(f"Capture started on {device_info['name']}")
 
                 while self.running:
+                    # ★★★ 3. 暂停逻辑 ★★★
+                    if self.paused:
+                        time.sleep(0.1)
+                        # 发送 0 音量，让进度条归零
+                        self.volume_updated.emit(0.0)
+                        continue
+
                     data = stream.read(1024, exception_on_overflow=False)
                     frames.append(data)
+
+                    # ★★★ 4. 计算实时音量并发送 ★★★
+                    # 简单取一段数据算音量，为了性能不需要非常精确
+                    temp_np = np.frombuffer(data, dtype=np.int16)
+                    temp_float = temp_np.astype(np.float32) / 32768.0
+                    vol = np.max(np.abs(temp_float))
+                    self.volume_updated.emit(vol)
 
                     if len(frames) >= frames_needed:
                         audio_bytes = b''.join(frames)
@@ -225,6 +245,9 @@ class AudioWorker(QThread):
                             audio_float = audio_float * (0.8 / (max_vol + 1e-6))
                             audio_float = np.clip(audio_float, -1.0, 1.0)
 
+                        # ★ 新增：发送音量信号给 UI 画波形
+                        self.volume_updated.emit(max_vol)
+
                         if not self.audio_queue.full():
                             self.audio_queue.put({"data": audio_float})
 
@@ -241,3 +264,8 @@ class AudioWorker(QThread):
     def stop(self):
         self.running = False
         self.wait()
+
+    # ★★★ 5. 切换暂停方法 ★★★
+    def toggle_pause(self):
+        self.paused = not self.paused
+        logging.info(f"暂停状态切换: {self.paused}")
