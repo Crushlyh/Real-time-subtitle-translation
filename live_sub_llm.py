@@ -25,9 +25,10 @@ LLM_API_KEY = "lm-studio"  # 本地模型通常随便填
 LLM_MODEL_NAME = "local-model"
 
 # 2. Whisper 设置
-WHISPER_SIZE = "medium"  # 既然有LLM做后处理，Whisper可以用medium提速
+WHISPER_SIZE = "large-v3"  # 既然有LLM做后处理，Whisper可以用medium提速
 DEVICE = "cuda"
-BUFFER_DURATION = 1.5
+BUFFER_DURATION = 2.0  # 稍微延长切片时间到 2秒
+OVERLAP_DURATION = 0.5 # ★新增：每次多听前 0.5秒 的声音，防止切词
 
 
 # =============================================================
@@ -62,6 +63,8 @@ class AudioWorker(QThread):
             self.status_updated.emit("⚠️ 本地 LLM 未连接")
 
         p = pyaudio.PyAudio()
+        # 存储上一段音频的末尾
+        prev_audio_chunk = np.array([], dtype=np.float32)
 
         while True:
             try:
@@ -95,7 +98,7 @@ class AudioWorker(QThread):
                 frames = []
                 frames_needed = int(sys_rate * BUFFER_DURATION / 1024)
 
-                logging.info("开始采集音频流...")
+                logging.info(f"监听中... (缓冲区: {BUFFER_DURATION}s, 重叠: {OVERLAP_DURATION}s)")
 
                 while True:
                     try:
@@ -108,33 +111,49 @@ class AudioWorker(QThread):
                     if len(frames) >= frames_needed:
                         audio_bytes = b''.join(frames)
                         frames = []
-
+                        # 1. 转 Float32
                         audio_np = np.frombuffer(audio_bytes, dtype=np.int16)
                         audio_float = audio_np.astype(np.float32) / 32768.0
-
+                        # 2. 转单声道
                         if channels > 1:
                             audio_float = audio_float.reshape(-1, channels).mean(axis=1)
-
+                        # 3. 重采样
                         if sys_rate != target_rate:
                             num_samples = int(len(audio_float) * target_rate / sys_rate)
                             audio_float = signal.resample(audio_float, num_samples)
                             audio_float = np.clip(audio_float, -1.0, 1.0)
 
-                        if np.max(np.abs(audio_float)) < 0.01:
-                            continue
+                        max_vol = np.max(np.abs(audio_float))
+                        if max_vol < 0.01:
+                            continue  # 纯静音跳过
+                        elif max_vol < 0.5:
+                            # 如果最大音量不到 50%，尝试放大到 80%
+                            gain = 0.8 / (max_vol + 1e-6)
+                            audio_float = audio_float * gain
+                            audio_float = np.clip(audio_float, -1.0, 1.0)  # 防止爆音
+
+                        # 这能修复被切断的词
+                        if len(prev_audio_chunk) > 0:
+                            combined_audio = np.concatenate((prev_audio_chunk, audio_float))
+                        else:
+                            combined_audio = audio_float
+
+                        # 保存当前音频的最后 0.5秒，留给下一轮用
+                        overlap_samples = int(target_rate * OVERLAP_DURATION)
+                        prev_audio_chunk = audio_float[-overlap_samples:]
 
                         segments, _ = whisper.transcribe(
-                            audio_float,
+                            combined_audio,
                             beam_size=5,
                             vad_filter=True,
                             vad_parameters=dict(min_silence_duration_ms=400),
-                            condition_on_previous_text=False
+                            condition_on_previous_text=False,
+                            initial_prompt="请忽略不完整的句子"
                         )
 
                         raw_text = " ".join([s.text for s in segments]).strip()
 
                         if len(raw_text) < 2: continue
-
                         logging.info(f"[原文] {raw_text}")
 
                         final_text = raw_text
@@ -146,8 +165,7 @@ class AudioWorker(QThread):
                                         {"role": "system", "content": "翻译成中文。简练。"},
                                         {"role": "user", "content": raw_text}
                                     ],
-                                    temperature=0.1,
-                                    max_tokens=60
+                                    temperature=0.1, max_tokens=60
                                 )
                                 trans_text = completion.choices[0].message.content.strip()
                                 logging.info(f"[译文] {trans_text}")
