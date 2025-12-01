@@ -47,6 +47,7 @@ def main():
     # 连接暂停信号 (UI -> Logic)
     # 注意：Qt 信号不能直接连类方法，最好用 lambda 或封装一层，这里直接连 worker.toggle_pause
     window.pause_signal.connect(worker.toggle_pause)
+    window.language_signal.connect(worker.update_languages)
     # 启动后台线程
     worker.start()
     logging.info("后台音频线程已启动")

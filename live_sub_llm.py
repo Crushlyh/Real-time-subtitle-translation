@@ -51,15 +51,36 @@ LLM_MODEL_NAME = config.get("LLM", "model_name")
 class AudioWorker(QThread):
     text_updated = pyqtSignal(str, str)
     status_updated = pyqtSignal(str)
-    # ★ 新增：发送音量大小 (0.0 ~ 1.0)
     volume_updated = pyqtSignal(float)
 
     def __init__(self):
         super().__init__()
         self.running = True
-        self.paused = False  # ★ 新增：暂停状态
+        self.paused = False
         self.audio_queue = queue.Queue(maxsize=10)
         self.history_context = []
+
+        # ★★★ 新增：语言状态管理 ★★★
+        # 对应 UI 里的: ["Auto", "Zh", "En", "Ja", "Ko"]
+        self.src_lang_map = [None, "zh", "en", "ja", "ko"]
+        # 对应 UI 里的: ["Zh", "En", "Ja", "Ko"]
+        self.tgt_lang_map = ["中文", "English", "Japanese", "Korean"]
+
+        # 默认值
+        self.current_src_lang = None  # Auto
+        self.current_tgt_lang = "中文"
+
+    # ★★★ 新增：接收 UI 发来的语言变更信号 ★★★
+    def update_languages(self, src_idx, tgt_idx):
+        try:
+            self.current_src_lang = self.src_lang_map[src_idx]
+            self.current_tgt_lang = self.tgt_lang_map[tgt_idx]
+            logging.info(f"语言设置变更: 源=[{self.current_src_lang}] -> 目标=[{self.current_tgt_lang}]")
+
+            # 清空历史上下文，防止不同语言混淆
+            self.history_context = []
+        except IndexError:
+            pass
 
     def run(self):
         # 1. 初始化 Whisper
@@ -98,11 +119,14 @@ class AudioWorker(QThread):
             except queue.Empty:
                 continue
 
-            # --- A. Whisper 识别 ---
+            # --- A. Whisper 识别 (带语言参数) ---
             try:
                 segments, _ = whisper.transcribe(
                     audio_float,
                     beam_size=5,
+                    # ★★★ 关键修改：传入当前选择的源语言 ★★★
+                    # 如果是 None，Whisper 会自动检测
+                    language=self.current_src_lang,
                     vad_filter=True,
                     vad_parameters=dict(min_silence_duration_ms=MIN_SILENCE_MS),
                     condition_on_previous_text=False
@@ -114,55 +138,43 @@ class AudioWorker(QThread):
 
             if len(raw_text) < 2: continue
 
-            # --- B. LLM 翻译 ---
+            # --- B. LLM 翻译 (动态 Prompt) ---
             final_text = raw_text
             if client:
                 try:
-                    # 1. 构建上下文 (取最近 3 句，提供更多背景)
                     context_list = self.history_context[-3:]
                     context_str = " | ".join(context_list) if context_list else "无"
 
-                    # 2. 定义系统提示词 (System Prompt)
-                    # 这是提升效果的关键！
+                    # ★★★ 关键修改：Prompt 中插入目标语言 ★★★
                     system_prompt = f"""
-                    你是一位精通中英日多语言的【资深字幕翻译专家】。
-                    你的任务是将输入的语音识别（ASR）文本翻译成**地道、简洁、流畅的中文**。
+        你是一位资深同声传译。
+        任务：将输入的【{self.current_src_lang if self.current_src_lang else '语音内容'}】翻译成地道的【{self.current_tgt_lang}】。
 
-                    【翻译规则】：
-                    1. **口语化**：翻译要符合中文日常说话习惯，拒绝生硬的“翻译腔”。
-                    2. **意译优先**：结合上下文理解真实含义，不要逐字直译。例如 "It works" 翻译为 "这就行了" 而不是 "它工作"。
-                    3. **ASR纠错**：输入文本可能包含语音识别错误、语气词或断句错误，请自动修正逻辑，忽略无意义的 "um", "ah" 等填充词。
-                    4. **极简输出**：只输出翻译后的文本，**严禁**包含 "好的"、"翻译如下"、"Sure" 等任何解释性文字。
-                    5. **特殊情况**：如果输入是无意义的噪音或乱码，直接输出 "..."。
+        【规则】：
+        1. 风格口语化，自然流畅，拒绝机翻感。
+        2. 结合上下文意译。
+        3. 自动修正语音识别错误。
+        4. 严禁输出"好的"、"翻译如下"等废话。
+        5. 如果输入是乱码或噪音，输出"..."。
+        6. 对于一些语气助词不要进行联想翻译
+        7. 翻译间接明了，但同时做到不遗漏
 
-                    【上下文参考】：
-                    {context_str}
-                    """
-
-                    # 3. 发送请求
+        【上下文】：{context_str}
+        """
                     completion = client.chat.completions.create(
                         model=LLM_MODEL_NAME,
                         messages=[
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": raw_text}
                         ],
-                        # 温度稍微调高一点点，让用词更灵活，但不要太高防止胡编
-                        temperature=0.2,
-                        max_tokens=100
+                        temperature=0.2, max_tokens=100
                     )
 
-                    # 4. 获取结果
-                    translated_content = completion.choices[0].message.content.strip()
+                    final_text = completion.choices[0].message.content.strip()
+                    final_text = final_text.replace("翻译：", "").replace("译文：", "")
 
-                    # 二次清洗：防止模型有时候还是会吐出 "翻译：" 开头的字样
-                    translated_content = translated_content.replace("翻译：", "").replace("译文：", "")
-
-                    final_text = translated_content
-
-                    # 更新历史上下文
                     self.history_context.append(final_text)
-                    if len(self.history_context) > 10:
-                        self.history_context.pop(0)
+                    if len(self.history_context) > 10: self.history_context.pop(0)
 
                 except Exception as e:
                     logging.error(f"LLM Error: {e}")
